@@ -22,7 +22,36 @@ if (!process.env.ANTHROPIC_API_KEY) {
 describe.skipIf(!process.env.ANTHROPIC_API_KEY)('researchCompany — seed (real API)', () => {
   it('is callable and returns a non-empty response when given a company name', async () => {
     const result = await researchCompany('Stripe');
-    expect(typeof result).toBe('string');
-    expect((result as string).length).toBeGreaterThan(0);
+    expect(typeof result.text).toBe('string');
+    expect(result.text.length).toBeGreaterThan(0);
   });
 });
+
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.warn(
+    '[skip] ANTHROPIC_API_KEY unset — researchCompany (search wiring) real-API suite skipped',
+  );
+}
+if (!process.env.TAVILY_API_KEY) {
+  console.warn(
+    '[skip] TAVILY_API_KEY unset — researchCompany (search wiring) real-API suite skipped',
+  );
+}
+
+// (search wiring) only — asserts searchWeb is reachable and gets invoked
+// during a researchCompany run. Structured output ((structurer + persistence))
+// is a later-stage bullet and out of scope here.
+describe.skipIf(!process.env.ANTHROPIC_API_KEY || !process.env.TAVILY_API_KEY)(
+  'researchCompany — search wiring (real API)',
+  () => {
+    it('invokes searchWeb at least once during a research run', async () => {
+      const result = await researchCompany('Stripe');
+      expect(result.steps.length).toBeGreaterThan(1);
+
+      const toolCallNames = result.steps.flatMap((step) =>
+        step.toolCalls.map((call) => call.toolName),
+      );
+      expect(toolCallNames).toContain('searchWeb');
+    });
+  },
+);
