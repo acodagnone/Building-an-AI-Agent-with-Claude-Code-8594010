@@ -49,6 +49,7 @@ type ResolvedTable = {
 type AirtableSchema = {
   tools: McpToolMap;
   prospects: ResolvedTable;
+  outreach: ResolvedTable;
 };
 
 const schemaCache = new WeakMap<MCPClient, AirtableSchema>();
@@ -125,21 +126,30 @@ async function resolveSchema(client: MCPClient): Promise<AirtableSchema> {
   const baseId = requireEnv('AIRTABLE_BASE_ID');
   const { tables } = await callAirtableTool(tools, 'list_tables_for_base', { baseId });
 
-  const prospectsTable = (tables as Array<{ id: string; name: string; fields: Array<{ id: string; name: string }> }>).find(
-    (t) => t.name === 'Prospects',
-  );
+  const allTables = tables as Array<{ id: string; name: string; fields: Array<{ id: string; name: string }> }>;
+
+  const prospectsTable = allTables.find((t) => t.name === 'Prospects');
   if (!prospectsTable) {
     throw new Error('Airtable write fails: no table named "Prospects" found in the base.');
   }
+  const outreachTable = allTables.find((t) => t.name === 'Outreach');
+  if (!outreachTable) {
+    throw new Error('Airtable write fails: no table named "Outreach" found in the base.');
+  }
 
-  const fieldIds: Record<string, string> = {};
+  const prospectsFieldIds: Record<string, string> = {};
   for (const field of prospectsTable.fields) {
-    fieldIds[field.name] = field.id;
+    prospectsFieldIds[field.name] = field.id;
+  }
+  const outreachFieldIds: Record<string, string> = {};
+  for (const field of outreachTable.fields) {
+    outreachFieldIds[field.name] = field.id;
   }
 
   const schema: AirtableSchema = {
     tools,
-    prospects: { tableId: prospectsTable.id, fieldIds },
+    prospects: { tableId: prospectsTable.id, fieldIds: prospectsFieldIds },
+    outreach: { tableId: outreachTable.id, fieldIds: outreachFieldIds },
   };
   schemaCache.set(client, schema);
   return schema;
@@ -231,6 +241,73 @@ export async function upsertProspect(client: MCPClient, prospect: Prospect): Pro
   return created.records[0].id;
 }
 
+// Read primitive for outreach drafting (§12.3) — returns the record id plus
+// every Prospects field, decoded from r.cellValuesByFieldId[fldXXX]. Drafting
+// needs both the id (for the linked write to Outreach) and the field values
+// (for LLM context), and a single round trip beats two reads. Distinct from
+// getProspectIdByDomain, which stays id-only for callers that don't need the
+// full record.
+export async function getProspectByDomain(
+  client: MCPClient,
+  domain: string,
+): Promise<({ id: string } & Record<string, unknown>) | null> {
+  const baseId = requireEnv('AIRTABLE_BASE_ID');
+  const { tools, prospects } = await resolveSchema(client);
+  const domainFieldId = requireFieldId(prospects.fieldIds, 'domain');
+
+  const { records } = await callAirtableTool(tools, 'list_records_for_table', {
+    baseId,
+    tableId: prospects.tableId,
+    filters: { operands: [{ operator: '=', operands: [domainFieldId, domain] }] },
+  });
+
+  const record = records?.[0] as
+    | { id: string; cellValuesByFieldId?: Record<string, unknown> }
+    | undefined;
+  if (!record) return null;
+
+  const fields: Record<string, unknown> = {};
+  for (const [name, fieldId] of Object.entries(prospects.fieldIds)) {
+    fields[name] = record.cellValuesByFieldId?.[fieldId];
+  }
+
+  return { id: record.id, ...fields };
+}
+
+// §11.3 / §12.3 — the persistence path draftOutreach calls; never used by
+// research paths. typecast: true is load-bearing for the linked `prospect`
+// write (§13.4) — without it the linked cell silently null-coerces even
+// though isError stays false.
+export async function createOutreach(
+  client: MCPClient,
+  prospectId: string,
+  outreach: { subjectLine: string; emailBody: string; angleReasoning: string },
+): Promise<string> {
+  const baseId = requireEnv('AIRTABLE_BASE_ID');
+  const { tools, outreach: outreachTable } = await resolveSchema(client);
+  const { tableId, fieldIds } = outreachTable;
+
+  const fieldValues: Record<string, unknown> = {
+    subjectLine: outreach.subjectLine,
+    prospect: [prospectId],
+    emailBody: outreach.emailBody,
+    angleReasoning: outreach.angleReasoning,
+  };
+
+  const fields: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(fieldValues)) {
+    fields[requireFieldId(fieldIds, name)] = value;
+  }
+
+  const created = await callAirtableTool(tools, 'create_records_for_table', {
+    baseId,
+    tableId,
+    records: [{ fields }],
+    typecast: true,
+  });
+  return created.records[0].id;
+}
+
 export async function deleteProspectByDomain(client: MCPClient, domain: string): Promise<number> {
   const baseId = requireEnv('AIRTABLE_BASE_ID');
   const recordId = await getProspectIdByDomain(client, domain);
@@ -243,4 +320,48 @@ export async function deleteProspectByDomain(client: MCPClient, domain: string):
     recordIds: [recordId],
   });
   return 1;
+}
+
+// Read primitive — verification (§12.3) uses this, never a delete helper's
+// return count. Linked-record cells come back as `[{id, name}, ...]` objects
+// on this MCP surface, not bare `rec…` strings; check both shapes so a future
+// MCP-side shape change doesn't silently drop matches.
+export async function listOutreachByProspectId(client: MCPClient, prospectId: string): Promise<string[]> {
+  const baseId = requireEnv('AIRTABLE_BASE_ID');
+  const { tools, outreach } = await resolveSchema(client);
+  const prospectFieldId = requireFieldId(outreach.fieldIds, 'prospect');
+
+  const { records } = await callAirtableTool(tools, 'list_records_for_table', {
+    baseId,
+    tableId: outreach.tableId,
+  });
+
+  const linkMatches = (entry: unknown): boolean =>
+    typeof entry === 'string' ? entry === prospectId : (entry as { id?: string })?.id === prospectId;
+
+  const matches = ((records ?? []) as Array<{ id: string; cellValuesByFieldId?: Record<string, unknown> }>).filter(
+    (r) => {
+      const value = r.cellValuesByFieldId?.[prospectFieldId];
+      return Array.isArray(value) && value.some(linkMatches);
+    },
+  );
+
+  return matches.map((r) => r.id);
+}
+
+export async function deleteOutreachByProspect(client: MCPClient, domain: string): Promise<number> {
+  const baseId = requireEnv('AIRTABLE_BASE_ID');
+  const prospectId = await getProspectIdByDomain(client, domain);
+  if (!prospectId) return 0;
+
+  const outreachIds = await listOutreachByProspectId(client, prospectId);
+  if (outreachIds.length === 0) return 0;
+
+  const { tools, outreach } = await resolveSchema(client);
+  await callAirtableTool(tools, 'delete_records_for_table', {
+    baseId,
+    tableId: outreach.tableId,
+    recordIds: outreachIds,
+  });
+  return outreachIds.length;
 }

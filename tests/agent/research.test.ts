@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { describe, it, expect, vi, afterEach, beforeEach, beforeAll, afterAll } from 'vitest';
-import { researchCompany, structureProspect, ProspectSchema } from '../src/agent/research.ts';
-import { getAirtableMcp, deleteProspectByDomain } from '../src/tools/airtable.ts';
+import { researchCompany, structureProspect, ProspectSchema } from '../../src/agent/research.ts';
+import { getAirtableMcp, deleteProspectByDomain } from '../../src/tools/airtable.ts';
 
 const PREFERENCES_PATH = 'src/memory/preferences.md';
 
